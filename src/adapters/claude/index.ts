@@ -8,8 +8,17 @@
 //   - never reads ~/.claude/ ourselves; the CLI does
 //
 // Auth model: the user is expected to have already run `claude login`. If not,
-// `claude --print` will exit non-zero with a message; we surface that as-is.
+// the chat path exits non-zero with a message; we surface that as-is.
+//
+// Health-check note (2026-04 perf fix): the previous probe ran a real
+// `claude --print ping` LLM call which cost real tokens and could take 10s+
+// on a cold start. We now detect auth via env API key OR the presence of
+// non-empty credential files in ~/.claude/ (or CLAUDE_CONFIG_DIR). The chat
+// path itself still validates auth on first call.
 
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Adapter } from "../base.js";
 import type { AdapterCallResult, ChatArgs, ProviderHealth } from "../../types.js";
 import { runCli, buildSanitizedEnv, which } from "../../run-cli.js";
@@ -52,23 +61,35 @@ export class ClaudeAdapter implements Adapter {
       /* ignore — fall through with null version */
     }
 
-    // Authed-check: a no-op `claude --print` that exits quickly. We send a
-    // benign prompt and a 5s idle timeout. If the CLI prompts for login, it
-    // exits non-zero with "Please run claude login" or similar.
+    // Auth detection — file-based, not LLM-based. Two valid auth shapes:
+    //   1. ANTHROPIC_AUTH_TOKEN env (instant authed).
+    //   2. Credential files cached in ~/.claude/ (or CLAUDE_CONFIG_DIR).
     let authed = false;
     let hint: string | undefined;
-    try {
-      const probe = await runCli({
-        binary,
-        args: ["--print", "ping"],
-        stdin: "",
-        env: buildSanitizedEnv(CLAUDE_ENV_KEEP),
-        idleTimeoutMs: 8_000,
-      });
-      authed = probe.exitCode === 0;
-      if (!authed) hint = (probe.stderr || probe.stdout).slice(0, 200) || "claude CLI returned non-zero exit";
-    } catch (e) {
-      hint = (e as Error).message?.slice(0, 200);
+    if (process.env.ANTHROPIC_AUTH_TOKEN) {
+      authed = true;
+    } else {
+      const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
+      const candidates = [
+        path.join(configDir, ".credentials.json"),
+        path.join(configDir, "credentials.json"),
+        path.join(configDir, "auth.json"),
+        path.join(configDir, "oauth.json"),
+      ];
+      for (const file of candidates) {
+        try {
+          const stat = await fs.stat(file);
+          if (stat.isFile() && stat.size > 0) {
+            authed = true;
+            break;
+          }
+        } catch {
+          /* file doesn't exist — try next */
+        }
+      }
+      if (!authed) {
+        hint = `no credentials in ${configDir} and no ANTHROPIC_AUTH_TOKEN env. Run: claude login`;
+      }
     }
 
     return { installed: true, authed, version, binary, hint };

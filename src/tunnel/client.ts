@@ -42,12 +42,18 @@ interface TunnelFrame {
 
 const RECONNECT_INITIAL_MS = 1_000;
 const RECONNECT_MAX_MS = 30_000;
+/** Outbound app-level keepalive cadence. The cloud sends pings every 25s and
+ * we reply with `pong`; we ALSO send our own pings on the same cadence so
+ * intermediaries (Cloudflare/Render) that key idle on either-direction traffic
+ * see continuous activity. Belt and suspenders. */
+const KEEPALIVE_MS = 25_000;
 
 export class TunnelClient {
   private ws: WebSocket | null = null;
   private closing = false;
   private reconnectMs = RECONNECT_INITIAL_MS;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private keepaliveTimer: NodeJS.Timeout | null = null;
   /** Cached provider snapshot. Reused on fast reconnects so we don't block
    * the WS upgrade window while running CLI probes. Refreshed asynchronously
    * after each successful open. */
@@ -76,6 +82,7 @@ export class TunnelClient {
   stop(): void {
     this.closing = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
     if (this.ws) {
       try {
         this.ws.close(1000, "client shutdown");
@@ -105,6 +112,18 @@ export class TunnelClient {
       this.reconnectMs = RECONNECT_INITIAL_MS;
       // eslint-disable-next-line no-console
       console.log("[pf-mcp] tunnel: connected; sending mcp_hello (fast)");
+      // Start outbound keepalive. Idle WSS connections through Cloudflare are
+      // closed with code 1006 after their idle threshold; periodic pings keep
+      // the path warm even if the cloud's heartbeat misfires.
+      if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = setInterval(() => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        try {
+          ws.send(JSON.stringify({ type: "ping", t: Date.now() }));
+        } catch {
+          /* close handler will run */
+        }
+      }, KEEPALIVE_MS);
       // Send a minimal hello IMMEDIATELY so the cloud upserts the runner row
       // and registers capabilities, without waiting on slow CLI probes that
       // could let intermediaries (Cloudflare/Render) close an idle WS.
@@ -178,6 +197,10 @@ export class TunnelClient {
       console.log(
         `[pf-mcp] tunnel: closed code=${code} reason=${reason?.toString() || ""}`,
       );
+      if (this.keepaliveTimer) {
+        clearInterval(this.keepaliveTimer);
+        this.keepaliveTimer = null;
+      }
       this.ws = null;
       if (this.closing) return;
       this.scheduleReconnect();

@@ -8,7 +8,16 @@
 // We use `exec` (one-shot) and prefer reading the prompt from stdin where
 // supported. If the installed codex version doesn't accept stdin, we fall
 // back to passing -p inline.
+//
+// Health-check note (2026-04 perf fix): the previous probe ran a real
+// `codex exec ping` LLM call which cost real tokens and could take 10s+ on
+// a cold start. We now detect auth via env OPENAI_API_KEY OR the presence
+// of non-empty credential files in ~/.codex/ (or CODEX_CONFIG_DIR). The
+// chat path itself still validates auth on first call.
 
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Adapter } from "../base.js";
 import type { AdapterCallResult, ChatArgs, ProviderHealth } from "../../types.js";
 import { runCli, buildSanitizedEnv, which } from "../../run-cli.js";
@@ -49,21 +58,35 @@ export class CodexAdapter implements Adapter {
       /* ignore */
     }
 
-    // Auth check: run a fast `codex exec` with a no-op prompt. Codex returns
-    // non-zero when not logged in.
+    // Auth detection — file-based, not LLM-based. Two valid auth shapes:
+    //   1. OPENAI_API_KEY env (instant authed).
+    //   2. Credential files cached in ~/.codex/ (or CODEX_CONFIG_DIR).
     let authed = false;
     let hint: string | undefined;
-    try {
-      const probe = await runCli({
-        binary,
-        args: ["exec", "--skip-git-repo-check", "ping"],
-        env: buildSanitizedEnv(CODEX_ENV_KEEP),
-        idleTimeoutMs: 8_000,
-      });
-      authed = probe.exitCode === 0;
-      if (!authed) hint = (probe.stderr || probe.stdout).slice(0, 200) || "codex CLI returned non-zero exit";
-    } catch (e) {
-      hint = (e as Error).message?.slice(0, 200);
+    if (process.env.OPENAI_API_KEY) {
+      authed = true;
+    } else {
+      const configDir = process.env.CODEX_CONFIG_DIR || path.join(os.homedir(), ".codex");
+      const candidates = [
+        path.join(configDir, "auth.json"),
+        path.join(configDir, "credentials.json"),
+        path.join(configDir, "oauth.json"),
+        path.join(configDir, "session.json"),
+      ];
+      for (const file of candidates) {
+        try {
+          const stat = await fs.stat(file);
+          if (stat.isFile() && stat.size > 0) {
+            authed = true;
+            break;
+          }
+        } catch {
+          /* file doesn't exist — try next */
+        }
+      }
+      if (!authed) {
+        hint = `no credentials in ${configDir} and no OPENAI_API_KEY env. Run: codex login`;
+      }
     }
 
     return { installed: true, authed, version, binary, hint };
