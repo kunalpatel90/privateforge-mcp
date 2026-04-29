@@ -27,6 +27,7 @@ import { ClaudeAdapter } from "./adapters/claude/index.js";
 import { CodexAdapter } from "./adapters/codex/index.js";
 import { GeminiAdapter } from "./adapters/gemini/index.js";
 import { HealthAdapter } from "./adapters/health/index.js";
+import { getWarmPool } from "./tools.js";
 
 function readEnvNumber(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -68,6 +69,19 @@ function resolveModes(argv: string[]): Modes {
 async function main(): Promise<void> {
   const server = new McpServer();
   const modes = resolveModes(process.argv);
+
+  // Warm-pool: pre-warm the CLIs at boot and keep them warm via a periodic
+  // tiny chat call. This dramatically reduces cold-start latency on the
+  // first real call after a quiet period (the orchestrator round-robins
+  // between providers, so any single CLI may sit idle 1–4 minutes between
+  // real calls). The pool calls markUsed() on every successful real chat,
+  // so a busy CLI never pays for a redundant warm tick.
+  //
+  // Pre-warm runs in the background — we don't await it, the server is
+  // serving requests within milliseconds of boot.
+  const warmPool = getWarmPool();
+  warmPool.preWarm();
+  warmPool.startTicker();
 
   if (modes.stdio) {
     startStdioServer(server);
@@ -112,6 +126,7 @@ async function main(): Promise<void> {
     const shutdown = (signal: string) => {
       // In stdio mode, keep stdout clean — log to stderr only.
       process.stderr.write(`[pf-mcp] received ${signal}, shutting down\n`);
+      warmPool.stop();
       tunnel.stop();
       setTimeout(() => process.exit(0), 250);
     };

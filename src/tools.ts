@@ -11,6 +11,7 @@ import { GeminiAdapter } from "./adapters/gemini/index.js";
 import { FsAdapter } from "./adapters/fs/index.js";
 import { ShellAdapter } from "./adapters/shell/index.js";
 import { HealthAdapter } from "./adapters/health/index.js";
+import { WarmPool } from "./warmpool.js";
 import type { McpTool, McpCallToolResult } from "./types.js";
 
 const claude = new ClaudeAdapter();
@@ -19,6 +20,21 @@ const gemini = new GeminiAdapter();
 const fs = new FsAdapter();
 const shell = new ShellAdapter();
 const health = new HealthAdapter(claude, codex, gemini);
+
+// Single warm-pool instance shared by all chat tools. Real chat calls call
+// markUsed() so the keepalive ticker skips a CLI that's already being driven.
+// Configuration via env so we don't need a redeploy to tune.
+const warmPool = new WarmPool([claude, codex, gemini], {
+  intervalMs: Number(process.env.PF_MCP_WARM_INTERVAL_MS) || undefined,
+  staleAfterMs: Number(process.env.PF_MCP_WARM_STALE_MS) || undefined,
+  warmTimeoutMs: Number(process.env.PF_MCP_WARM_TIMEOUT_MS) || undefined,
+  disabled: process.env.PF_MCP_WARM_DISABLE === "1",
+});
+
+/** Exposed so index.ts can pre-warm at boot and start the keepalive ticker. */
+export function getWarmPool(): WarmPool {
+  return warmPool;
+}
 
 function asText(text: string): McpCallToolResult {
   return { content: [{ type: "text", text }] };
@@ -72,6 +88,9 @@ export function buildTools(): McpTool[] {
             cwd: typeof raw.cwd === "string" ? raw.cwd : undefined,
             timeoutMs: typeof raw.timeoutMs === "number" ? raw.timeoutMs : undefined,
           });
+          // Mark as used so the keepalive ticker doesn't fire a redundant warm
+          // call on top of an already-active CLI.
+          warmPool.markUsed(adapter.id);
           return asText(r.text);
         } catch (e) {
           return asError(e);
