@@ -48,6 +48,20 @@ export class TunnelClient {
   private closing = false;
   private reconnectMs = RECONNECT_INITIAL_MS;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** Cached provider snapshot. Reused on fast reconnects so we don't block
+   * the WS upgrade window while running CLI probes. Refreshed asynchronously
+   * after each successful open. */
+  private lastCaps: Record<string, unknown> | null = null;
+
+  private fastInstalledCaps(): Record<string, unknown> {
+    // Optimistic stub — claims providers are present; cloud uses optimistic
+    // fallback for healthy state until the refresh hello arrives.
+    return {
+      claude: { installed: true, authed: true, version: null, lastSuccessAt: null },
+      codex:  { installed: true, authed: true, version: null, lastSuccessAt: null },
+      gemini: { installed: true, authed: false, version: null, lastSuccessAt: null },
+    };
+  }
 
   constructor(
     private readonly server: McpServer,
@@ -73,7 +87,10 @@ export class TunnelClient {
 
   private connect(): void {
     if (this.closing) return;
-    const url = this.opts.gatewayUrl.replace(/\/+$/, "") + "/v1/proxy";
+    let url = this.opts.gatewayUrl.replace(/\/+$/, "") + "/v1/proxy";
+    if (this.opts.machineId) {
+      url += `?machineId=${encodeURIComponent(this.opts.machineId)}`;
+    }
     const headers: Record<string, string> = {
       authorization: `Bearer ${this.opts.token}`,
     };
@@ -84,23 +101,47 @@ export class TunnelClient {
     const ws = new WebSocket(url, { headers, perMessageDeflate: false });
     this.ws = ws;
 
-    ws.on("open", async () => {
+    ws.on("open", () => {
       this.reconnectMs = RECONNECT_INITIAL_MS;
       // eslint-disable-next-line no-console
-      console.log("[pf-mcp] tunnel: connected; sending mcp_hello");
+      console.log("[pf-mcp] tunnel: connected; sending mcp_hello (fast)");
+      // Send a minimal hello IMMEDIATELY so the cloud upserts the runner row
+      // and registers capabilities, without waiting on slow CLI probes that
+      // could let intermediaries (Cloudflare/Render) close an idle WS.
       try {
-        const caps = await this.providerCapabilities();
+        const fastCaps = this.lastCaps ?? this.fastInstalledCaps();
         const hello = {
           type: "mcp_hello",
           v: this.server.serverInfo.version,
           tool_registry_hash: this.server.toolRegistryHash(),
-          provider_capabilities: caps,
+          provider_capabilities: fastCaps,
         };
         ws.send(JSON.stringify(hello));
       } catch (e) {
         // eslint-disable-next-line no-console
-        console.error(`[pf-mcp] tunnel: hello failed: ${(e as Error).message}`);
+        console.error(`[pf-mcp] tunnel: fast-hello failed: ${(e as Error).message}`);
       }
+      // Then asynchronously run the real provider health check and emit a
+      // refreshed mcp_hello with full installed+authed snapshot.
+      void (async () => {
+        try {
+          const caps = await this.providerCapabilities();
+          this.lastCaps = caps;
+          if (ws.readyState !== WebSocket.OPEN) return;
+          const hello = {
+            type: "mcp_hello",
+            v: this.server.serverInfo.version,
+            tool_registry_hash: this.server.toolRegistryHash(),
+            provider_capabilities: caps,
+          };
+          ws.send(JSON.stringify(hello));
+          // eslint-disable-next-line no-console
+          console.log("[pf-mcp] tunnel: refreshed mcp_hello with full caps");
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.error(`[pf-mcp] tunnel: refresh-hello failed: ${(e as Error).message}`);
+        }
+      })();
     });
 
     ws.on("message", async (raw) => {
