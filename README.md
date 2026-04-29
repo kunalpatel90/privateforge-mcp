@@ -47,6 +47,23 @@ Point any MCP client at `http://127.0.0.1:7820/mcp`. Tools available:
 | `pf.health.providers` | Snapshot of CLI install/auth status |
 | `pf.diag.envinfo` | Runner host diagnostics |
 
+### As a Claude Code plugin
+
+Clone this repo somewhere stable, then point Claude Code at it:
+
+```bash
+git clone https://github.com/kunalpatel90/privateforge-mcp.git ~/.claude/plugins/pf-mcp
+```
+
+The `.mcp.json` and `.claude-plugin/plugin.json` are wired so Claude Code's plugin loader spawns `pf-mcp` over stdio (`node dist/index.js --stdio`). On first run the `start:plugin` script installs deps and builds. From a Claude Code session:
+
+```
+/plugin install pf-mcp
+/reload-plugins
+```
+
+Claude can now call `pf.codex.chat`, `pf.gemini.chat`, etc. — useful for cross-model orchestration without leaving Claude Code.
+
 ### Cloud mode (PrivateForge tunnel)
 
 Set two env vars to enable the outbound WSS tunnel:

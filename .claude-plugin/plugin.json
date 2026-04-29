@@ -1,0 +1,13 @@
+{
+  "name": "pf-mcp",
+  "description": "PrivateForge local MCP server — wraps Claude/Codex/Gemini CLIs under a stable pf.* tool namespace. Lets Claude Code call out to other coding CLIs (and run local fs/shell tools) without ever proxying credentials.",
+  "version": "0.1.0",
+  "keywords": [
+    "mcp",
+    "claude",
+    "codex",
+    "gemini",
+    "cli",
+    "privateforge"
+  ]
+}
