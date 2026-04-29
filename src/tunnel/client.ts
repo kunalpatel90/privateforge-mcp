@@ -1,0 +1,204 @@
+// tunnel/client.ts — outbound WSS tunnel to PrivateForge cloud.
+//
+// Wire surface (matches server/routes-proxy.ts on the cloud):
+//
+//   pf-mcp -> SaaS:
+//     { type: "mcp_hello",    v, tool_registry_hash, provider_capabilities }
+//     { type: "mcp_response", reqId, ok, result?, error? }
+//     { type: "mcp_progress", reqId, progress }
+//     { type: "pong" }     — reply to server pings
+//     { type: "ping" }     — also accepted, server replies with pong
+//
+//   SaaS -> pf-mcp:
+//     { type: "mcp_request", reqId, method, params }
+//     { type: "ping" }
+//
+// Connection lifecycle:
+//   1. open WSS to <gatewayUrl>/v1/proxy with Authorization: Bearer <token>
+//   2. on open: emit mcp_hello with version + tool_registry_hash + provider_caps
+//   3. for each inbound mcp_request: dispatch via McpServer, emit mcp_response
+//   4. exponential backoff reconnect on close (1s -> 30s ceiling)
+
+import WebSocket from "ws";
+import { McpServer, type JsonRpcRequest } from "../mcp-server.js";
+
+export interface TunnelOpts {
+  /** e.g. "wss://api.privateforge.ai" — `/v1/proxy` is appended */
+  gatewayUrl: string;
+  /** desktop session token (long-lived) used as Bearer auth */
+  token: string;
+  /** Stable machine identity. Cloud uses this to dedupe sockets. */
+  machineId?: string;
+  /** Optional X-PF-Auth nonce HMAC header (when PF_REQUIRE_NONCE=1 cloud-side). */
+  pfAuthHeader?: string;
+}
+
+interface TunnelFrame {
+  type: string;
+  reqId?: string;
+  method?: string;
+  params?: unknown;
+}
+
+const RECONNECT_INITIAL_MS = 1_000;
+const RECONNECT_MAX_MS = 30_000;
+
+export class TunnelClient {
+  private ws: WebSocket | null = null;
+  private closing = false;
+  private reconnectMs = RECONNECT_INITIAL_MS;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+
+  constructor(
+    private readonly server: McpServer,
+    private readonly opts: TunnelOpts,
+    private readonly providerCapabilities: () => Promise<Record<string, unknown>>,
+  ) {}
+
+  start(): void {
+    this.connect();
+  }
+
+  stop(): void {
+    this.closing = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.ws) {
+      try {
+        this.ws.close(1000, "client shutdown");
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private connect(): void {
+    if (this.closing) return;
+    const url = this.opts.gatewayUrl.replace(/\/+$/, "") + "/v1/proxy";
+    const headers: Record<string, string> = {
+      authorization: `Bearer ${this.opts.token}`,
+    };
+    if (this.opts.pfAuthHeader) headers["x-pf-auth"] = this.opts.pfAuthHeader;
+
+    // eslint-disable-next-line no-console
+    console.log(`[pf-mcp] tunnel: connecting to ${url}`);
+    const ws = new WebSocket(url, { headers, perMessageDeflate: false });
+    this.ws = ws;
+
+    ws.on("open", async () => {
+      this.reconnectMs = RECONNECT_INITIAL_MS;
+      // eslint-disable-next-line no-console
+      console.log("[pf-mcp] tunnel: connected; sending mcp_hello");
+      try {
+        const caps = await this.providerCapabilities();
+        const hello = {
+          type: "mcp_hello",
+          v: this.server.serverInfo.version,
+          tool_registry_hash: this.server.toolRegistryHash(),
+          provider_capabilities: caps,
+        };
+        ws.send(JSON.stringify(hello));
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error(`[pf-mcp] tunnel: hello failed: ${(e as Error).message}`);
+      }
+    });
+
+    ws.on("message", async (raw) => {
+      let frame: TunnelFrame;
+      try {
+        frame = JSON.parse(raw.toString()) as TunnelFrame;
+      } catch {
+        return;
+      }
+      if (!frame || typeof frame.type !== "string") return;
+
+      switch (frame.type) {
+        case "ping":
+          try {
+            ws.send(JSON.stringify({ type: "pong", t: Date.now() }));
+          } catch {
+            /* ignore */
+          }
+          return;
+        case "pong":
+          return;
+        case "mcp_request": {
+          if (typeof frame.reqId !== "string" || typeof frame.method !== "string") return;
+          await this.handleRequest(ws, frame.reqId, frame.method, frame.params);
+          return;
+        }
+        default:
+          return;
+      }
+    });
+
+    ws.on("close", (code, reason) => {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[pf-mcp] tunnel: closed code=${code} reason=${reason?.toString() || ""}`,
+      );
+      this.ws = null;
+      if (this.closing) return;
+      this.scheduleReconnect();
+    });
+
+    ws.on("error", (err) => {
+      // eslint-disable-next-line no-console
+      console.error(`[pf-mcp] tunnel: socket error: ${err.message}`);
+    });
+  }
+
+  private async handleRequest(
+    ws: WebSocket,
+    reqId: string,
+    method: string,
+    params: unknown,
+  ): Promise<void> {
+    const rpc: JsonRpcRequest = {
+      jsonrpc: "2.0",
+      id: reqId,
+      method,
+      params: (params as Record<string, unknown>) ?? {},
+    };
+    try {
+      const response = await this.server.dispatch(rpc);
+      if (response === null) return; // notification — nothing to send
+      if ("error" in response) {
+        ws.send(
+          JSON.stringify({
+            type: "mcp_response",
+            reqId,
+            ok: false,
+            error: response.error,
+          }),
+        );
+      } else {
+        ws.send(
+          JSON.stringify({
+            type: "mcp_response",
+            reqId,
+            ok: true,
+            result: response.result,
+          }),
+        );
+      }
+    } catch (e) {
+      ws.send(
+        JSON.stringify({
+          type: "mcp_response",
+          reqId,
+          ok: false,
+          error: { code: -32603, message: (e as Error).message },
+        }),
+      );
+    }
+  }
+
+  private scheduleReconnect(): void {
+    const delay = this.reconnectMs;
+    this.reconnectMs = Math.min(this.reconnectMs * 2, RECONNECT_MAX_MS);
+    // eslint-disable-next-line no-console
+    console.log(`[pf-mcp] tunnel: reconnecting in ${delay}ms`);
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+}

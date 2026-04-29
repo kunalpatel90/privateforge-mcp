@@ -1,0 +1,39 @@
+{
+  "name": "@privateforge/mcp",
+  "version": "0.1.0",
+  "description": "PrivateForge local MCP server — wraps Claude/Codex/Gemini CLIs under a stable pf.* tool namespace.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kunalpatel90/privateforge-mcp.git"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "pf-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "test": "node --import tsx --test src/**/*.test.ts",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
