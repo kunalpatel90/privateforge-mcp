@@ -6,7 +6,15 @@
 //
 // The Gemini CLI reads from ~/.gemini/ for OAuth state. As with Claude/Codex,
 // we don't touch those files.
+//
+// Health check note: the `gemini --prompt ping` probe is a real LLM call and
+// can take 10–20s on first cold start, which exceeds any sane health-check
+// budget. We instead inspect ~/.gemini/oauth_creds.json (or the env API key)
+// to decide `authed`. The actual chat path still validates auth on first call.
 
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Adapter } from "../base.js";
 import type { AdapterCallResult, ChatArgs, ProviderHealth } from "../../types.js";
 import { runCli, buildSanitizedEnv, which } from "../../run-cli.js";
@@ -47,19 +55,37 @@ export class GeminiAdapter implements Adapter {
       /* ignore */
     }
 
+    // Auth detection — file-based, not LLM-based. Two valid auth shapes:
+    //   1. Env API key (GEMINI_API_KEY / GOOGLE_API_KEY) — instant authed.
+    //   2. OAuth credentials cached at ~/.gemini/oauth_creds.json.
+    // The Gemini CLI also accepts a custom config dir via GEMINI_CONFIG_DIR.
     let authed = false;
     let hint: string | undefined;
-    try {
-      const probe = await runCli({
-        binary,
-        args: ["--prompt", "ping"],
-        env: buildSanitizedEnv(GEMINI_ENV_KEEP),
-        idleTimeoutMs: 8_000,
-      });
-      authed = probe.exitCode === 0;
-      if (!authed) hint = (probe.stderr || probe.stdout).slice(0, 200) || "gemini CLI returned non-zero exit";
-    } catch (e) {
-      hint = (e as Error).message?.slice(0, 200);
+    if (process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+      authed = true;
+    } else {
+      const configDir = process.env.GEMINI_CONFIG_DIR || path.join(os.homedir(), ".gemini");
+      const candidates = [
+        path.join(configDir, "oauth_creds.json"),
+        // Newer CLI builds may use these; check defensively so a future rename
+        // doesn't silently regress us back to the slow probe.
+        path.join(configDir, "credentials.json"),
+        path.join(configDir, "auth.json"),
+      ];
+      for (const file of candidates) {
+        try {
+          const stat = await fs.stat(file);
+          if (stat.isFile() && stat.size > 0) {
+            authed = true;
+            break;
+          }
+        } catch {
+          /* file doesn't exist — try next */
+        }
+      }
+      if (!authed) {
+        hint = `no credentials in ${configDir} and no GEMINI_API_KEY/GOOGLE_API_KEY env. Run: gemini auth`;
+      }
     }
 
     return { installed: true, authed, version, binary, hint };
