@@ -12,13 +12,14 @@
 //
 // Health-check note (2026-04 perf fix): the previous probe ran a real
 // `claude --print ping` LLM call which cost real tokens and could take 10s+
-// on a cold start. We now detect auth via env API key OR the presence of
-// non-empty credential files in ~/.claude/ (or CLAUDE_CONFIG_DIR). The chat
-// path itself still validates auth on first call.
+// on a cold start. We now detect auth via env API key OR the macOS Keychain
+// OR the presence of non-empty credential files in ~/.claude/ (or
+// CLAUDE_CONFIG_DIR). The chat path itself still validates auth on first call.
 
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import type { Adapter } from "../base.js";
 import type { AdapterCallResult, ChatArgs, ProviderHealth } from "../../types.js";
 import { runCli, buildSanitizedEnv, which } from "../../run-cli.js";
@@ -27,9 +28,115 @@ const CLAUDE_ENV_KEEP = [
   // Anthropic CLI honors these; we keep them so users who set them in their
   // shell rc still work. We do NOT inject any from our own process.
   "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_API_KEY",
   "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_OAUTH_TOKEN",
   "CLAUDE_CONFIG_DIR",
 ];
+
+/** Result of the auth detection probe. Pure data, easy to test. */
+export interface AuthProbeResult {
+  authed: boolean;
+  hint?: string;
+}
+
+/** Injectable dependencies for `detectAuth` so tests don't shell out or hit disk. */
+export interface AuthProbeDeps {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  homedir: () => string;
+  /** Resolves true iff `file` exists, is a regular file, and is non-empty. */
+  fileExistsNonEmpty: (file: string) => Promise<boolean>;
+  /** Resolves true iff the macOS Keychain has a "Claude Code-credentials" entry. */
+  keychainHasClaudeEntry: () => Promise<boolean>;
+}
+
+/**
+ * Detect whether Claude Code is authenticated, in the order specified:
+ *   1. ANTHROPIC_AUTH_TOKEN env
+ *   2. ANTHROPIC_API_KEY env
+ *   3. CLAUDE_CODE_OAUTH_TOKEN env
+ *   4. macOS Keychain entry (darwin only)
+ *   5. credential files in ~/.claude/ (or CLAUDE_CONFIG_DIR)
+ */
+export async function detectAuth(deps: AuthProbeDeps): Promise<AuthProbeResult> {
+  if (deps.env.ANTHROPIC_AUTH_TOKEN) return { authed: true };
+  if (deps.env.ANTHROPIC_API_KEY) return { authed: true };
+  if (deps.env.CLAUDE_CODE_OAUTH_TOKEN) return { authed: true };
+
+  if (deps.platform === "darwin") {
+    try {
+      if (await deps.keychainHasClaudeEntry()) return { authed: true };
+    } catch {
+      /* fall through to file-based check */
+    }
+  }
+
+  const configDir = deps.env.CLAUDE_CONFIG_DIR || path.join(deps.homedir(), ".claude");
+  const candidates = [
+    path.join(configDir, ".credentials.json"),
+    path.join(configDir, "credentials.json"),
+    path.join(configDir, "auth.json"),
+    path.join(configDir, "oauth.json"),
+  ];
+  for (const file of candidates) {
+    if (await deps.fileExistsNonEmpty(file)) return { authed: true };
+  }
+
+  const hint =
+    deps.platform === "darwin"
+      ? "no Claude Code credentials in macOS Keychain (Keychain Access > 'Claude Code') and no env auth. Run: claude /login"
+      : `no credentials in ${configDir} and no ANTHROPIC_AUTH_TOKEN env. Run: claude login`;
+  return { authed: false, hint };
+}
+
+async function defaultFileExistsNonEmpty(file: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(file);
+    return stat.isFile() && stat.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Probe the macOS Keychain for the Claude Code credentials entry. Uses
+ * `security find-generic-password` without `-w` so the secret is never
+ * printed. Exit code 0 means the entry exists. Short timeout because the
+ * `security` binary is local and instant.
+ */
+function defaultKeychainHasClaudeEntry(): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const account = process.env.USER || process.env.LOGNAME || "";
+    const args = ["find-generic-password", "-s", "Claude Code-credentials"];
+    if (account) args.push("-a", account);
+    let child;
+    try {
+      child = spawn("/usr/bin/security", args, {
+        stdio: ["ignore", "ignore", "ignore"],
+      });
+    } catch {
+      resolve(false);
+      return;
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* ignore */
+      }
+      resolve(false);
+    }, 3_000);
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0);
+    });
+  });
+}
 
 export class ClaudeAdapter implements Adapter {
   readonly id = "claude" as const;
@@ -61,36 +168,13 @@ export class ClaudeAdapter implements Adapter {
       /* ignore — fall through with null version */
     }
 
-    // Auth detection — file-based, not LLM-based. Two valid auth shapes:
-    //   1. ANTHROPIC_AUTH_TOKEN env (instant authed).
-    //   2. Credential files cached in ~/.claude/ (or CLAUDE_CONFIG_DIR).
-    let authed = false;
-    let hint: string | undefined;
-    if (process.env.ANTHROPIC_AUTH_TOKEN) {
-      authed = true;
-    } else {
-      const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), ".claude");
-      const candidates = [
-        path.join(configDir, ".credentials.json"),
-        path.join(configDir, "credentials.json"),
-        path.join(configDir, "auth.json"),
-        path.join(configDir, "oauth.json"),
-      ];
-      for (const file of candidates) {
-        try {
-          const stat = await fs.stat(file);
-          if (stat.isFile() && stat.size > 0) {
-            authed = true;
-            break;
-          }
-        } catch {
-          /* file doesn't exist — try next */
-        }
-      }
-      if (!authed) {
-        hint = `no credentials in ${configDir} and no ANTHROPIC_AUTH_TOKEN env. Run: claude login`;
-      }
-    }
+    const { authed, hint } = await detectAuth({
+      platform: process.platform,
+      env: process.env,
+      homedir: os.homedir,
+      fileExistsNonEmpty: defaultFileExistsNonEmpty,
+      keychainHasClaudeEntry: defaultKeychainHasClaudeEntry,
+    });
 
     return { installed: true, authed, version, binary, hint };
   }
